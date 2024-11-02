@@ -6,8 +6,55 @@ from .sparsegpt import SparseGPT
 from transformers import AutoModelForCausalLM, AutoTokenizer, TrainingArguments, BitsAndBytesConfig
 from torch.ao.pruning import WeightNormSparsifier
 from peft import LoraConfig, PeftModel
-from trl import SFTTrainer
+from trl import SFTTrainer, SFTConfig
 from datasets import load_dataset
+from .layerwrapper import WrappedGPT
+
+
+def prepare_calibration_input(model, dataloader, device):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.layers
+    
+    if "model.embed_tokens" in model.hf_device_map:
+        device = model.hf_device_map["model.embed_tokens"]
+
+    dtype = next(iter(model.parameters())).dtype
+    inps = torch.zeros((128, model.seqlen, model.config.hidden_size), dtype=dtype, device=device)
+    inps.requires_grad = False
+    cache = {'i': 0, 'attention_mask': None, "position_ids": None}
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+        def forward(self, inp, **kwargs):
+            inps[cache['i']] = inp
+            cache['i'] += 1
+            cache['attention_mask'] = kwargs['attention_mask']
+            cache['position_ids'] = kwargs['position_ids']
+            raise ValueError
+    layers[0] = Catcher(layers[0])
+    for batch in dataloader:
+        try:
+            model(batch[0].to(device))
+        except ValueError:
+            pass 
+    layers[0] = layers[0].module
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache['attention_mask']
+    position_ids = cache['position_ids']
+    model.config.use_cache = use_cache
+
+    return inps, outs, attention_mask, position_ids 
+
+def return_given_alpha(alpha, sort_res, W_metric, tmp_metric, sum_before):
+    thres_cumsum = sum_before * alpha 
+    sort_mask = tmp_metric <= thres_cumsum.reshape((-1,1))
+    thres = torch.gather(sort_res[0], dim=1, index=sort_mask.sum(dim=1, keepdims=True)-1)
+    W_mask = (W_metric <= thres)
+    cur_sparsity = (W_mask==True).sum() / W_mask.numel()
+    return W_mask, cur_sparsity
 
 
 def finetune_model(model_dir, dataset_name, output_dir="./results"):
@@ -15,18 +62,21 @@ def finetune_model(model_dir, dataset_name, output_dir="./results"):
     torch_dtype = torch.bfloat16
     compute_dtype = getattr(torch, "float16")
     
+    '''
     quant_config = BitsAndBytesConfig(
         load_in_4bit=True,
         bnb_4bit_quant_type="nf4",
         bnb_4bit_compute_dtype=compute_dtype,
         bnb_4bit_use_double_quant=False,
     )
+    '''
 
     # Load the model with quantization
     model = AutoModelForCausalLM.from_pretrained(
         model_dir,
-        quantization_config=quant_config,
-        device_map={"": 0},
+        torch_dtype=torch.float16,
+        #quantization_config=quant_config,
+        device_map= "auto",
         low_cpu_mem_usage=True
     )
     model.config.use_cache = False
@@ -40,7 +90,7 @@ def finetune_model(model_dir, dataset_name, output_dir="./results"):
     )
     tokenizer.pad_token = tokenizer.eos_token
     tokenizer.padding_side = "right"
-
+    '''
     # Define PEFT parameters
     peft_params = LoraConfig(
         lora_alpha=16,
@@ -49,22 +99,18 @@ def finetune_model(model_dir, dataset_name, output_dir="./results"):
         bias="none",
         task_type="CAUSAL_LM",
     )
+    '''
     # Define training arguments
-    training_params = TrainingArguments(
+    training_params = SFTConfig(
         output_dir=output_dir,
         num_train_epochs=1,
-        max_steps=10,
+        max_steps=20,
         per_device_train_batch_size=1,
-        gradient_accumulation_steps=4,
-        optim="paged_adamw_8bit",
-        warmup_steps=0.03,
+        gradient_accumulation_steps=1,
         learning_rate=2e-4,
-        fp16=True,
+        # fp16=False,
         save_steps=10,
-        logging_steps=1000,
-        push_to_hub=False,
         group_by_length=True,
-        report_to='tensorboard',
     )
 
     # Load the Guanaco dataset
@@ -79,7 +125,6 @@ def finetune_model(model_dir, dataset_name, output_dir="./results"):
         max_seq_length=256,
         tokenizer=tokenizer,
         args=training_params,
-        packing=False,
     )
     trainer.neftune_noise_alpha = None
 
@@ -103,7 +148,6 @@ def load_finetuned_model(base_model_id, peft_checkpoint_dir):
     model = PeftModel.from_pretrained(base_model, peft_checkpoint_dir)
     model = model.merge_and_unload()  # Merge adapters and unload them from the model
     print("Fine-tuned model loaded and adapters merged.")
-    model = AutoGPTQForCausalLM.from_pretrained(peft_checkpoint_dir)
     return model
 
 def prune_magnitude(args, model, tokenizer):
@@ -125,11 +169,11 @@ def prune_magnitude(args, model, tokenizer):
     sparsifier.prepare(model, sparse_config)
     sparsifier.step()
     # sparsifier.squash_mask()
-
-    save_model_and_tokenizer(model, tokenizer, args.sparsified_model_dir)
+    
+    save_model_and_tokenizer(model, tokenizer, args.pruned_model_dir)
 
     # Finetune model
-    finetune_model(args.sparsified_model_dir, args.finetune_dataset, "./results")
+    finetune_model(args.pruned_model_dir, args.finetune_dataset, "./results")
 
     # Load, merge and save the fine-tuned model
     model = load_finetuned_model(args.model, args.peft_checkpoint_dir)
@@ -142,7 +186,7 @@ def prune_magnitude(args, model, tokenizer):
 
     
 @torch.no_grad()
-def prune_sparsegpt(args, model, tokenizer):
+def prune_sparsegpt(args, model, tokenizer, prune_n=0, prune_m=0):
     print("Starting...")
     dataloader, _ = get_loaders(
         args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
@@ -224,8 +268,8 @@ def prune_sparsegpt(args, model, tokenizer):
                 sparsity = args.sparsity
                 gpts[name].fasterprune(
                     sparsity,
-                    prunen=args.prunen,
-                    prunem=args.prunem,
+                    prunen=prune_n,
+                    prunem=prune_m,
                     percdamp=0.01,
                     blocksize=128,
                 )
@@ -243,4 +287,69 @@ def prune_sparsegpt(args, model, tokenizer):
 
     model.config.use_cache = use_cache
 
-    return quantizers
+    return model
+
+
+def prune_wanda(args, model, tokenizer, device=torch.device("cuda:0"), prune_n=0, prune_m=0):
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    print("loading calibdation data")
+    dataloader, _ = get_loaders(
+        args.dataset, nsamples=args.nsamples, seed=args.seed, model=args.model, seqlen=model.seqlen
+    )
+    print("dataset loading complete")
+    with torch.no_grad():
+        inps, outs, attention_mask, position_ids = prepare_calibration_input(model, dataloader, device)
+
+    layers = model.model.layers
+    for i in range(len(layers)):
+        layer = layers[i]
+        subset = find_layers(layer)
+
+        wrapped_layers = {}
+        for name in subset:
+            wrapped_layers[name] = WrappedGPT(subset[name])
+
+        def add_batch(name):
+            def tmp(_, inp, out):
+                wrapped_layers[name].add_batch(inp[0].data, out.data)
+            return tmp
+
+        handles = []
+        for name in wrapped_layers:
+            handles.append(subset[name].register_forward_hook(add_batch(name)))
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        for h in handles:
+            h.remove()
+
+        for name in subset:
+            print(f"pruning layer {i} name {name}")
+            W_metric = torch.abs(subset[name].weight.data) * torch.sqrt(wrapped_layers[name].scaler_row.reshape((1,-1)))
+
+            W_mask = (torch.zeros_like(W_metric) == 1)  ## initialize a mask to be all False
+            if prune_n != 0:
+                # structured n:m sparsity
+                for ii in range(W_metric.shape[1]):
+                    if ii % prune_m == 0:
+                        tmp = W_metric[:,ii:(ii+prune_m)].float()
+                        W_mask.scatter_(1,ii+torch.topk(tmp, prune_n,dim=1, largest=False)[1], True)
+            else:
+                sort_res = torch.sort(W_metric, dim=-1, stable=True)
+
+                # unstructured pruning
+                indices = sort_res[1][:,:int(W_metric.shape[1]*args.sparsity_ratio)]
+                W_mask.scatter_(1, indices, True)
+
+            subset[name].weight.data[W_mask] = 0  ## set weights to zero
+
+        for j in range(args.nsamples):
+            with torch.no_grad():
+                outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask, position_ids=position_ids)[0]
+        inps, outs = outs, inps
+
+    model.config.use_cache = use_cache
+
+    return model

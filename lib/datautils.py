@@ -2,6 +2,7 @@ import random
 
 import numpy as np
 import torch
+from torch import nn
 from datasets import load_dataset
 from transformers import AutoTokenizer, LlamaTokenizer
 
@@ -243,7 +244,6 @@ def load_data(data_path, tokenizer, n_samples):
 
     return dataset
 
-
 @torch.no_grad()
 def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     print("Evaluating ...")
@@ -289,20 +289,50 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     torch.cuda.empty_cache()
 
     outs = torch.zeros_like(inps)
-    attention_mask = cache["attention_mask"]
-
+    attention_mask = cache["attention_mask"].to(dev)
+    print(len(layers))
+   
     for i in range(len(layers)):
         print(i)
+        layer = layers[i]
+        from accelerate.hooks import remove_hook_from_module
+        # Remove accelerate hooks from the layer
+        remove_hook_from_module(layer)
+        # Access the underlying module if wrapped
+        if hasattr(layer, 'module'):
+            layer = layer.module
+
+        # Move the layer to the device
+        layer = layer.to(dev)
+
+        for j in range(nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask)[0]
+
+        # Move the layer back to CPU
+        layer = layer.cpu()
+        # Re-wrap the layer with accelerate hooks if necessary
+        layers[i] = layer
+        del layer
+        torch.cuda.empty_cache()
+        inps, outs = outs, inps
+   
+    '''
+    for i in range(len(layers)):
+        print(i)
+        
+        from accelerate.hooks import remove_hook_from_module
+        remove_hook_from_module(layers[i])
+
         layer = layers[i].to(dev)
 
 
         for j in range(nsamples):
-            outs[j] = layer(inps[j].unsqueeze(0), attention_mask=attention_mask)[0]
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask)[0]
         layers[i] = layer.cpu()
         del layer
         torch.cuda.empty_cache()
         inps, outs = outs, inps
-
+    '''
     if model.model.norm is not None:
         model.model.norm = model.model.norm.to(dev)
     model.lm_head = model.lm_head.to(dev)
@@ -326,3 +356,137 @@ def llama_eval(model, testenc, dev,  dataset: str, log_wandb: bool = False):
     print(f"Perplexity: {ppl.item():3f}")
 
     model.config.use_cache = use_cache
+
+
+@torch.no_grad()
+def llama_eval_quant(model, testenc, dev,  dataset: str, log_wandb: bool = False):
+    print("Evaluating ...")
+
+    testenc = testenc.input_ids
+    nsamples = testenc.numel() // model.seqlen
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+    layers = model.model.model.layers
+
+    model.model.model.embed_tokens = model.model.model.embed_tokens.to(dev)
+    layers[0] = layers[0].to(dev)
+
+    dtype = next(iter(model.model.parameters())).dtype
+    inps = torch.zeros(
+        (nsamples, model.seqlen, model.config.hidden_size), dtype=dtype, device=dev
+    )
+    cache = {"i": 0, "attention_mask": None}
+
+    class Catcher(nn.Module):
+        def __init__(self, module):
+            super().__init__()
+            self.module = module
+
+        def forward(self, inp, **kwargs):
+            inps[cache["i"]] = inp
+            cache["i"] += 1
+            cache["attention_mask"] = kwargs["attention_mask"]
+            raise ValueError
+
+    layers[0] = Catcher(layers[0])
+    for i in range(nsamples):
+        batch = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)].to(dev)
+        try:
+            model(batch)
+        except ValueError:
+            pass
+    layers[0] = layers[0].module
+
+    layers[0] = layers[0].cpu()
+    model.model.model.embed_tokens = model.model.model.embed_tokens.cpu()
+    torch.cuda.empty_cache()
+
+    outs = torch.zeros_like(inps)
+    attention_mask = cache["attention_mask"].to(dev)
+    print(len(layers))
+
+    for i in range(len(layers)):
+        print(i)
+        layer = layers[i]
+        #from accelerate.hooks import remove_hook_from_module
+        # Remove accelerate hooks from the layer
+        #remove_hook_from_module(layer)
+        # Access the underlying module if wrapped
+        if hasattr(layer, 'module'):
+            layer = layer.module
+
+        # Move the layer to the device
+        layer = layer.to(dev)
+
+        for j in range(nsamples):
+            outs[j] = layer(inps[j].unsqueeze(0).to(dev), attention_mask=attention_mask)[0]
+
+        # Move the layer back to CPU
+        layer = layer.cpu()
+        # Re-wrap the layer with accelerate hooks if necessary
+        layers[i] = layer
+        del layer
+        torch.cuda.empty_cache()
+        inps, outs = outs, inps
+
+    if model.model.model.norm is not None:
+        model.model.model.norm = model.model.model.norm.to(dev)
+    model.model.lm_head = model.model.lm_head.to(dev)
+
+    testenc = testenc.to(dev)
+    nlls = []
+    for i in range(nsamples):
+        hidden_states = inps[i].unsqueeze(0)
+        if model.model.model.norm is not None:
+            hidden_states = model.model.model.norm(hidden_states)
+        lm_logits = model.model.lm_head(hidden_states)
+        shift_logits = lm_logits[:, :-1, :].contiguous()
+        shift_labels = testenc[:, (i * model.seqlen) : ((i + 1) * model.seqlen)][:, 1:]
+        loss_fct = nn.CrossEntropyLoss()
+        loss = loss_fct(
+            shift_logits.view(-1, shift_logits.size(-1)), shift_labels.view(-1)
+        )
+        neg_log_likelihood = loss.float() * model.seqlen
+        nlls.append(neg_log_likelihood)
+    ppl = torch.exp(torch.stack(nlls).sum() / (nsamples * model.seqlen))
+    print(f"Perplexity: {ppl.item():3f}")
+
+    model.config.use_cache = use_cache
+
+
+
+@torch.no_grad()
+def llama_eval_wanda(model, testenc, dev, dataset: str, log_wandb: bool = False):
+    print("Evaluating ...")
+
+    model = model.to(dev)
+    model.eval()
+    testenc = testenc.input_ids.to(dev)
+    nsamples = testenc.numel() // model.seqlen
+
+    use_cache = model.config.use_cache
+    model.config.use_cache = False
+
+    nlls = []
+    for i in range(nsamples):
+        batch = testenc[:, (i * model.seqlen): ((i + 1) * model.seqlen)]
+        outputs = model(batch, labels=batch)
+
+        loss = outputs.loss
+
+        # Check for NaN in loss
+        if torch.isnan(loss):
+            print(f"Loss is NaN at sample {i}")
+            continue
+
+        neg_log_likelihood = loss.float() * model.seqlen
+        nlls.append(neg_log_likelihood)
+
+    total_nll = torch.stack(nlls).sum()
+    avg_nll = total_nll / (nsamples * model.seqlen)
+    ppl = torch.exp(avg_nll)
+    print(f"Perplexity: {ppl.item():3f}")
+
+    model.config.use_cache = use_cache
+
