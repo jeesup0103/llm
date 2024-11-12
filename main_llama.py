@@ -19,7 +19,13 @@ from lib.datautils import *
 from lib.prune import *
 torch.manual_seed(100)
 
-def get_llama(model):
+def is_llama_model(model_name):
+    return "llama" in model_name.lower()
+
+def is_opt_model(model_name):
+    return "opt" in model_name.lower()
+
+def get_model(model):
     import torch
     def skip(*args, **kwargs):
         pass
@@ -71,35 +77,37 @@ if __name__ == "__main__":
         prune_n, prune_m = map(int, args.sparsity_type.split(":")) 
 
     # Get Model
-    model = get_llama(model_name)
-    model.eval()
-    print("Pruning in process")
-    
-    # If model is llama
+    model = get_model(model_name)
+    model.eval()    
     
     # PRUNE
-    if args.prune_method == "magnitude":
-        model = prune_magnitude_llama(args, model, tokenizer)
-    elif args.prune_method == "sparsegpt":
-        model = prune_sparsegpt_llama(args, model, tokenizer, prune_n, prune_m)
-    elif args.prune_method == "wanda":
-         model = prune_wanda_llama(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
-    else:
-        print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
-        sys.exit(1)
+    if is_llama_model(model_name):
+        print("Applying LLaMA model pruning")
+        if args.prune_method == "magnitude":
+            model = prune_magnitude_llama(args, model, tokenizer)
+        elif args.prune_method == "sparsegpt":
+            model = prune_sparsegpt_llama(args, model, tokenizer, prune_n, prune_m)
+        elif args.prune_method == "wanda":
+            model = prune_wanda_llama(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
+        else:
+            print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
+            sys.exit(1)
         
     # IF model is OPT
     # PRUNE
-    if args.prune_method == "magnitude":
-        model = prune_magnitude_opt(args, model, tokenizer)
-    elif args.prune_method == "sparsegpt":
-        model = prune_sparsegpt_opt(args, model, tokenizer, prune_n, prune_m)
-    elif args.prune_method == "wanda":
-         model = prune_wanda_opt(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
+    elif is_opt_model(model_name):
+        print("Applying OPT model pruning")
+        if args.prune_method == "magnitude":
+            model = prune_magnitude_opt(args, model, tokenizer)
+        elif args.prune_method == "sparsegpt":
+            model = prune_sparsegpt_opt(args, model, tokenizer, prune_n, prune_m)
+        elif args.prune_method == "wanda":
+            model = prune_wanda_opt(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
+        else:
+            print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
+            sys.exit(1)
     else:
-        print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
-        sys.exit(1)
-    
+        print("ERROR: Invalid model. Choice=[[\"Llama\", \"OPT\"]"
     print("Pruning completed")
     
      
