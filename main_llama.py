@@ -28,7 +28,7 @@ def get_llama(model):
     torch.nn.init.normal_ = skip
     model = LlamaForCausalLM.from_pretrained(
         model, 
-        torch_dtype= 'auto', 
+        torch_dtype= torch.float16, 
         device_map = "auto"
     )
     model.seqlen = model.config.max_position_embeddings 
@@ -75,13 +75,27 @@ if __name__ == "__main__":
     model.eval()
     print("Pruning in process")
     
+    # If model is llama
+    
     # PRUNE
     if args.prune_method == "magnitude":
-        model = prune_magnitude(args, model, tokenizer)
+        model = prune_magnitude_llama(args, model, tokenizer)
     elif args.prune_method == "sparsegpt":
-        model = prune_sparsegpt(args, model, tokenizer, prune_n, prune_m)
+        model = prune_sparsegpt_llama(args, model, tokenizer, prune_n, prune_m)
     elif args.prune_method == "wanda":
-         model = prune_wanda(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
+         model = prune_wanda_llama(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
+    else:
+        print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
+        sys.exit(1)
+        
+    # IF model is OPT
+    # PRUNE
+    if args.prune_method == "magnitude":
+        model = prune_magnitude_opt(args, model, tokenizer)
+    elif args.prune_method == "sparsegpt":
+        model = prune_sparsegpt_opt(args, model, tokenizer, prune_n, prune_m)
+    elif args.prune_method == "wanda":
+         model = prune_wanda_opt(args, model, tokenizer, prune_n = prune_n, prune_m = prune_m)
     else:
         print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
         sys.exit(1)
