@@ -159,7 +159,6 @@ if __name__ == "__main__":
         opt_eval(model,  testloader, DEV, args.dataset)
     
     
-    
     # QUANTIZE
     print("Quantization in process")
     # Apply AUTOgptq
