@@ -10,7 +10,7 @@ from transformers import Trainer, TrainingArguments
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel, LoraConfig
 from trl import SFTTrainer
-from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
+from auto_gptq import AutoGPTQForCausalLM, OPTForCausalLM,BaseQuantizeConfig
 import argparse
 import time
 from transformers import LlamaForCausalLM
@@ -25,14 +25,27 @@ def is_llama_model(model_name):
 def is_opt_model(model_name):
     return "opt" in model_name.lower()
 
-def get_model(model):
-    import torch
+def get_model_llama(model):
     def skip(*args, **kwargs):
         pass
     torch.nn.init.kaiming_uniform_ = skip
     torch.nn.init.uniform_ = skip
     torch.nn.init.normal_ = skip
     model = LlamaForCausalLM.from_pretrained(
+        model, 
+        torch_dtype= torch.float16, 
+        device_map = "auto"
+    )
+    model.seqlen = model.config.max_position_embeddings 
+    return model
+
+def get_model_opt(model):
+    def skip(*args, **kwargs):
+        pass
+    torch.nn.init.kaiming_uniform_ = skip
+    torch.nn.init.uniform_ = skip
+    torch.nn.init.normal_ = skip
+    model = OPTForCausalLM.from_pretrained(
         model, 
         torch_dtype= torch.float16, 
         device_map = "auto"
@@ -76,12 +89,13 @@ if __name__ == "__main__":
         assert args.sparsity_ratio == 0.5, "sparsity ratio must be 0.5 for structured N:M sparsity"
         prune_n, prune_m = map(int, args.sparsity_type.split(":")) 
 
-    # Get Model
-    model = get_model(model_name)
-    model.eval()    
+        
     
     # PRUNE
     if is_llama_model(model_name):
+        # Get Model
+        model = get_model_llama(model_name)
+        model.eval()
         print("Applying LLaMA model pruning")
         if args.prune_method == "magnitude":
             model = prune_magnitude_llama(args, model, tokenizer)
@@ -96,6 +110,9 @@ if __name__ == "__main__":
     # IF model is OPT
     # PRUNE
     elif is_opt_model(model_name):
+        # Get Model
+        model = get_model_opt(model_name)
+        model.eval()
         print("Applying OPT model pruning")
         if args.prune_method == "magnitude":
             model = prune_magnitude_opt(args, model, tokenizer)
