@@ -124,26 +124,39 @@ if __name__ == "__main__":
             print("ERROR: Invalid prune method. Choice=[\"magnitude\", \"sparsegpt\", \"wanda\"]")
             sys.exit(1)
     else:
-        print("ERROR: Invalid model. Choice=[[\"Llama\", \"OPT\"]"
+        print("ERROR: Invalid model. Choice=[[\"Llama\", \"OPT\"]")
+        sys.exit(1)
     print("Pruning completed")
-    
-     
     save_model_and_tokenizer(model, tokenizer, pruned_model_dir)  
     
-    
-    model = LlamaForCausalLM.from_pretrained(
-        args.pruned_model_dir,
-        torch_dtype= torch.float16,
-        device_map = "cuda:0"
-    )
-    model.eval()
-    model.seqlen = 2048
+    # Load model from saved dir
+    if is_llama_model(model_name):
+        model = LlamaForCausalLM.from_pretrained(
+            args.pruned_model_dir,
+            torch_dtype= torch.float16,
+            device_map = "cuda:0"
+        )
+        model.eval()
+        model.seqlen = 2048
+    else:
+        model = OPTForCausalLM.from_pretrained(
+            args.pruned_model_dir,
+            torch_dtype= torch.float16,
+            device_map = "cuda:0"
+        )
+        model.eval()
+        model.seqlen = 2048
+        
+        
     # Evaluate
     dataloader, testloader = get_loaders(
         args.dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
     print("Dataset:", args.dataset)
-    llama_eval(model, testloader, DEV, args.dataset)
+    if is_llama_model(model_name):
+        llama_eval(model, testloader, DEV, args.dataset)
+    else:
+        opt_eval(model,  testloader, DEV, args.dataset)
     
     
     
@@ -180,6 +193,11 @@ if __name__ == "__main__":
         args.dataset, seed=args.seed, model=args.model, seqlen=model.seqlen
     )
     print("Dataset:", args.dataset)
-    llama_eval_wanda(model, testloader, DEV, args.dataset)
+    if is_llama_model(model_name):
+        llama_eval(model, testloader, DEV, args.dataset)
+    else:
+        opt_eval(model,  testloader, DEV, args.dataset)
+    
+    
 
 
