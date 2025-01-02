@@ -10,10 +10,10 @@ from transformers import Trainer, TrainingArguments
 from transformers import AutoModelForCausalLM, AutoTokenizer, BitsAndBytesConfig
 from peft import PeftModel, LoraConfig
 from trl import SFTTrainer
-from auto_gptq import AutoGPTQForCausalLM, OPTForCausalLM,BaseQuantizeConfig
+from auto_gptq import AutoGPTQForCausalLM, BaseQuantizeConfig
 import argparse
 import time
-from transformers import LlamaForCausalLM
+from transformers import LlamaForCausalLM, OPTForCausalLM
 from lib.modelutils import *
 from lib.datautils import *
 from lib.prune import *
@@ -48,7 +48,8 @@ def get_model_opt(model):
     model = OPTForCausalLM.from_pretrained(
         model, 
         torch_dtype= torch.float16, 
-        device_map = "auto"
+        low_cpu_mem_usage=True,
+        device_map = "cuda:0"
     )
     model.seqlen = model.config.max_position_embeddings 
     return model
