@@ -4,3 +4,4 @@ quantized_model
 finetuned_model
 wanda_pruned
 wanda_quantized
+.DS_Store
